@@ -66,12 +66,16 @@
     els.settingsPanel.classList.toggle('hidden', !v);
   }
 
+  var DEFAULT_SERVER = 'wss://lj.2111803140.workers.dev';
+
   function setNetVisible(v) {
     els.netPanel.classList.toggle('hidden', !v);
     if (v) {
-      // 回填服务器地址
-      var saved = localStorage.getItem('gmx_server');
-      if (saved && els.netServerInput.value === '') els.netServerInput.value = saved;
+      // 自动填入服务器地址：优先已保存的地址 → Worker 默认地址
+      if (!els.netServerInput.value) {
+        var saved = localStorage.getItem('gmx_server');
+        els.netServerInput.value = saved || DEFAULT_SERVER;
+      }
     }
   }
 
@@ -158,7 +162,7 @@
       });
       els.btnNetCreate.addEventListener('click', function () {
         window.SFX.click();
-        var serverUrl = els.netServerInput.value.trim() || 'ws://127.0.0.1:9120';
+        var serverUrl = els.netServerInput.value.trim() || DEFAULT_SERVER;
         localStorage.setItem('gmx_server', serverUrl);
         window.NetPlay.createRoom(serverUrl);
       });
@@ -174,7 +178,7 @@
           // 第二次点击：连接并加入
           var code = els.netRoomInput.value.trim().toUpperCase();
           if (!code) { els.netStatus.textContent = '⚠️ 请输入房间号'; return; }
-          var serverUrl = els.netServerInput.value.trim() || 'ws://127.0.0.1:9120';
+          var serverUrl = els.netServerInput.value.trim() || DEFAULT_SERVER;
           localStorage.setItem('gmx_server', serverUrl);
           window.NetPlay.joinRoom(serverUrl, code);
         }

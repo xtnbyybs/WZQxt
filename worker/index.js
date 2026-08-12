@@ -1,16 +1,15 @@
 /**
- * 五子棋 · 星穹连珠 — Cloudflare Worker 免费版信令服务器
- * 使用全局 Map 内存存储 + 原生 WebSocketPair，不依赖 Durable Objects
+ * 五子棋 · 星穹连珠 v2 — Cloudflare Worker 免费版信令服务器
+ * 支持双方准备制 + 观战席
  */
 'use strict';
 
-// 房间存储：Map<roomId, { players: Map<WebSocket, {side}>, createTime }>
 const rooms = new Map();
 
 function cleanupStale() {
   const now = Date.now();
   for (const [rid, room] of rooms.entries()) {
-    if (room.players.size === 0 && (now - room.createTime) > 30 * 60 * 1000) {
+    if (room.seats.size === 0 && room.specs.size === 0 && (now - room.createTime) > 30 * 60 * 1000) {
       rooms.delete(rid);
     }
   }
@@ -20,113 +19,158 @@ function send(ws, data) {
   try { ws.send(JSON.stringify(data)); } catch (e) {}
 }
 
-function broadcast(room, data, exclude) {
-  for (const [w] of room.players.entries()) {
-    if (w !== exclude) send(w, data);
+function broadcastAll(room, data, exclude) {
+  room.seats.forEach((_, w) => { if (w !== exclude) send(w, data); });
+  room.specs.forEach(w => { if (w !== exclude) send(w, data); });
+}
+
+function getSeatsInfo(room) {
+  const info = [];
+  room.seats.forEach((v) => info.push({ side: v.side, ready: v.ready }));
+  return info;
+}
+
+function handleLeave(room, ws, role, side) {
+  if (role === 'seat') {
+    room.seats.delete(ws);
+    room.gameStarted = false;
+    broadcastAll(room, { type: 'opponent_left', side: side, seats: getSeatsInfo(room) });
+  } else if (role === 'spec') {
+    room.specs.delete(ws);
+    broadcastAll(room, { type: 'spectator_left', specCount: room.specs.size });
   }
+  if (room.seats.size === 0 && room.specs.size === 0) {
+    rooms.delete(room.roomId);
+  }
+  try { ws.close(1000, 'left'); } catch (e) {}
 }
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
-
-    if (url.pathname === '/health') {
-      return new Response('ok');
+    if (url.pathname === '/health') return new Response('ok');
+    if (!url.pathname.startsWith('/room/')) {
+      return new Response('五子棋信令服务', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    if (url.pathname.startsWith('/room/')) {
-      const roomId = url.pathname.split('/room/')[1]?.toUpperCase() || 'UNKN';
-      cleanupStale();
+    const roomId = url.pathname.split('/room/')[1]?.toUpperCase() || 'UNKN';
+    cleanupStale();
+    let room = rooms.get(roomId);
+    if (!room) {
+      room = {
+        roomId, seats: new Map(), specs: new Set(),
+        moves: [], gameStarted: false, createTime: Date.now(), currentSide: 1
+      };
+      rooms.set(roomId, room);
+    }
 
-      let room = rooms.get(roomId);
-      if (!room) {
-        room = { players: new Map(), createTime: Date.now() };
-        rooms.set(roomId, room);
-      }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
 
-      if (room.players.size >= 2) {
-        const pair = new WebSocketPair();
-        const [client, server] = Object.values(pair);
-        server.accept();
-        send(server, { type: 'error', message: '房间已满' });
-        setTimeout(() => { try { server.close(1000, 'full'); } catch (e) {} }, 100);
-        return new Response(null, { status: 101, webSocket: client });
-      }
+    let role = null;
+    let mySide = 0;
 
-      const pair = new WebSocketPair();
-      const [client, server] = Object.values(pair);
-      server.accept();
+    server.addEventListener('message', (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (e) { return; }
 
-      let side = 0;
+      switch (msg.type) {
 
-      server.addEventListener('message', (event) => {
-        let msg;
-        try { msg = JSON.parse(event.data); } catch (e) { return; }
+        case 'create':
+          if (role) break;
+          role = 'seat';
+          mySide = 1;
+          room.seats.set(server, { side: 1, ready: false });
+          send(server, { type: 'room_created', room: roomId, side: 1, ready: false, seats: getSeatsInfo(room), started: room.gameStarted });
+          break;
 
-        switch (msg.type) {
+        case 'join':
+          if (role) break;
+          if (room.seats.size < 2) {
+            role = 'seat';
+            mySide = 2;
+            room.seats.set(server, { side: 2, ready: false });
+            send(server, { type: 'joined', side: 2, ready: false, seats: getSeatsInfo(room), started: room.gameStarted });
+            broadcastAll(room, { type: 'player_joined', side: 2, seats: getSeatsInfo(room) }, server);
+            if (room.seats.size === 2) room.seats.forEach(v => v.ready = false);
+          } else {
+            role = 'spec';
+            room.specs.add(server);
+            send(server, {
+              type: 'spectator',
+              moves: room.moves,
+              currentSide: room.currentSide,
+              seats: getSeatsInfo(room),
+              started: room.gameStarted,
+              specCount: room.specs.size
+            });
+            broadcastAll(room, { type: 'spectator_joined', specCount: room.specs.size }, server);
+          }
+          break;
 
-          case 'create':
-            if (side) break;
-            side = 1;
-            room.players.set(server, { side: 1 });
-            send(server, { type: 'room_created', room: roomId, side: 1 });
-            break;
-
-          case 'join':
-            if (side) break;
-            if (room.players.size >= 2) {
-              send(server, { type: 'error', message: '房间已满' });
-              server.close(1000, 'full');
-              return;
+        case 'ready':
+          if (role !== 'seat') break;
+          {
+            const info = room.seats.get(server);
+            if (!info) break;
+            info.ready = msg.ready !== false;
+            const seatsInfo = getSeatsInfo(room);
+            broadcastAll(room, { type: 'ready_update', side: info.side, ready: info.ready, seats: seatsInfo });
+            if (!room.gameStarted && room.seats.size === 2) {
+              let allReady = true;
+              room.seats.forEach(v => { if (!v.ready) allReady = false; });
+              if (allReady) {
+                room.gameStarted = true;
+                room.moves = [];
+                room.currentSide = 1;
+                room.seats.forEach((v, w) => send(w, { type: 'game_start', side: v.side, room: roomId, seats: seatsInfo }));
+                room.specs.forEach(w => send(w, { type: 'game_start', side: 0, room: roomId, seats: seatsInfo, spec: true }));
+              }
             }
-            side = 2;
-            room.players.set(server, { side: 2 });
-            send(server, { type: 'game_start', room: roomId, side: 2 });
-            broadcast(room, { type: 'game_start', room: roomId, side: 2 }, server);
-            break;
+          }
+          break;
 
-          case 'move':
-            if (!room.players.has(server)) return;
+        case 'move':
+          if (!room.gameStarted) return;
+          if (role !== 'seat') return;
+          {
+            const info = room.seats.get(server);
+            if (!info) return;
+            if (room.currentSide !== info.side) return;
             if (typeof msg.r !== 'number' || typeof msg.c !== 'number') return;
-            broadcast(room, { type: 'move', r: msg.r, c: msg.c, player: msg.player }, server);
-            break;
+            room.moves.push({ r: msg.r, c: msg.c, player: info.side });
+            room.currentSide = info.side === 1 ? 2 : 1;
+            broadcastAll(room, { type: 'move', r: msg.r, c: msg.c, player: info.side, currentSide: room.currentSide });
+          }
+          break;
 
-          case 'restart':
-            if (!room.players.has(server)) return;
-            broadcast(room, { type: 'restart' }, server);
-            break;
+        case 'restart':
+          if (role !== 'seat') return;
+          room.gameStarted = false;
+          room.moves = [];
+          room.currentSide = 1;
+          room.seats.forEach(v => v.ready = false);
+          {
+            const seatsInfo = getSeatsInfo(room);
+            broadcastAll(room, { type: 'restart', seats: seatsInfo });
+          }
+          break;
 
-          case 'leave':
-            broadcast(room, { type: 'opponent_left' }, server);
-            room.players.delete(server);
-            try { server.close(1000, 'left'); } catch (e) {}
-            if (room.players.size === 0) rooms.delete(roomId);
-            break;
+        case 'leave':
+          handleLeave(room, server, role, mySide);
+          break;
 
-          case 'ping':
-            send(server, { type: 'pong' });
-            break;
-        }
-      });
-
-      server.addEventListener('close', () => {
-        if (room.players.has(server)) {
-          room.players.delete(server);
-          broadcast(room, { type: 'opponent_left' }, server);
-          if (room.players.size === 0) rooms.delete(roomId);
-        }
-      });
-
-      server.addEventListener('error', () => {
-        room.players.delete(server);
-        if (room.players.size === 0) rooms.delete(roomId);
-      });
-
-      return new Response(null, { status: 101, webSocket: client });
-    }
-
-    return new Response('五子棋信令服务', {
-      headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        case 'ping':
+          send(server, { type: 'pong' });
+          break;
+      }
     });
+
+    server.addEventListener('close', () => handleLeave(room, server, role, mySide));
+    server.addEventListener('error', () => handleLeave(room, server, role, mySide));
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 };
+

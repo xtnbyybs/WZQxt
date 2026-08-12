@@ -1,7 +1,7 @@
 /**
  * 五子棋 · 星穹连珠 — Cloudflare Worker 信令服务器
  * 使用 Durable Objects 实现房间隔离
- * 
+ * OK
  * 部署后端点：wss://<worker名称>.<账户>.workers.dev/room/<房间号>
  */
 

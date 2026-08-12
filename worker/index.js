@@ -5,14 +5,19 @@
  * 部署后端点：wss://<worker名称>.<账户>.workers.dev/room/<房间号>
  */
 
-export class GameRoom {
+ export class GameRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
     this.sessions = new Map();  // WebSocket → { side: 1|2 }
+    this._roomId = null;  // 由 fetch 从 URL 中提取
   }
 
   async fetch(request) {
+    // 从请求 URL 提取房间号（DO 实例按 roomId 创建，每个实例对应一个房间）
+    const url = new URL(request.url);
+    this._roomId = url.pathname.split("/room/")[1]?.toUpperCase() || "????";
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
@@ -23,11 +28,12 @@ export class GameRoom {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
 
+    const roomId = this._roomId;  // 直接使用实例属性
+
     switch (msg.type) {
       case "create": {
         if (this.sessions.has(ws)) break;
         this.sessions.set(ws, { side: 1 });
-        const roomId = this._roomFromWs(ws) || "????";
         this._send(ws, { type: "room_created", room: roomId, side: 1 });
         break;
       }
@@ -40,7 +46,6 @@ export class GameRoom {
           return;
         }
         this.sessions.set(ws, { side: 2 });
-        const roomId = this._roomFromWs(ws) || "????";
         this._send(ws, { type: "game_start", room: roomId, side: 2 });
         for (const [w, meta] of this.sessions.entries()) {
           if (meta.side === 1) this._send(w, { type: "game_start", room: roomId, side: 1 });
@@ -81,16 +86,6 @@ export class GameRoom {
 
   async webSocketError(ws) {
     this.sessions.delete(ws);
-  }
-
-  _roomFromWs(ws) {
-    try {
-      if (ws.deserializeAttachment) {
-        const a = ws.deserializeAttachment();
-        return a?.room;
-      }
-    } catch (e) {}
-    return null;
   }
 
   _send(ws, data) {
